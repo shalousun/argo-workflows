@@ -58,10 +58,31 @@ func (woc *wfOperationCtx) garbageCollectArtifacts(ctx context.Context) error {
 		return nil
 	}
 
+	woc.log.WithFields(logging.Fields{
+		"workflow":               woc.wf.Name,
+		"namespace":              woc.wf.Namespace,
+		"phase":                  woc.wf.Status.Phase,
+		"deletionTimestamp":      woc.wf.DeletionTimestamp,
+		"completed":              woc.wf.Labels[common.LabelKeyCompleted],
+		"hasArtifactGCFinalizer": slices.Contains(woc.wf.Finalizers, common.FinalizerArtifactGC),
+	}).Info(ctx, "artifact GC reconciliation started")
+
 	// based on current state of Workflow, which Artifact GC Strategies can be processed now?
 	strategies := woc.artifactGCStrategiesReady()
+	if len(strategies) > 0 {
+		woc.log.WithFields(logging.Fields{
+			"workflow":   woc.wf.Name,
+			"strategies": slices.Collect(maps.Keys(strategies)),
+		}).Info(ctx, "artifact GC strategies ready to process")
+	} else {
+		woc.log.WithField("workflow", woc.wf.Name).Debug(ctx, "no artifact GC strategies ready to process")
+	}
+
 	for strategy := range strategies {
-		woc.log.WithField("strategy", strategy).Debug(ctx, "processing Artifact GC Strategy")
+		woc.log.WithFields(logging.Fields{
+			"workflow": woc.wf.Name,
+			"strategy": strategy,
+		}).Info(ctx, "processing artifact GC strategy")
 		err := woc.processArtifactGCStrategy(ctx, strategy)
 		if err != nil {
 			return err
@@ -136,8 +157,21 @@ func (woc *wfOperationCtx) processArtifactGCStrategy(ctx context.Context, strate
 
 	// Search for artifacts
 	artifactSearchResults := woc.findArtifactsToGC(strategy)
+	woc.log.WithFields(logging.Fields{
+		"workflow":      woc.wf.Name,
+		"strategy":      strategy,
+		"artifactCount": len(artifactSearchResults),
+	}).Info(ctx, "artifacts found for GC strategy")
 	if len(artifactSearchResults) == 0 {
-		woc.log.WithField("strategy", strategy).Debug(ctx, "No Artifact Search Results returned from strategy")
+		if woc.wf.Status.IsOffloadNodeStatus() {
+			woc.log.WithFields(logging.Fields{
+				"workflow":                 woc.wf.Name,
+				"strategy":                 strategy,
+				"offloadNodeStatusVersion": woc.wf.Status.OffloadNodeStatusVersion,
+			}).Warn(ctx, "no artifacts found for GC strategy but node status is offloaded; Nodes/CompressedNodes are empty so artifacts are not discoverable")
+		} else {
+			woc.log.WithField("strategy", strategy).Debug(ctx, "No Artifact Search Results returned from strategy")
+		}
 		return nil
 	}
 
@@ -586,6 +620,9 @@ func (woc *wfOperationCtx) processArtifactGCCompletion(ctx context.Context) erro
 		}
 	}
 
+	allDeleted := woc.allArtifactsDeleted(ctx)
+	allProcessed := woc.allStrategiesProcessed()
+
 	var removeFinalizer bool
 	forceFinalizerRemoval := woc.execWf.Spec.ArtifactGC != nil && woc.execWf.Spec.ArtifactGC.ForceFinalizerRemoval
 	if forceFinalizerRemoval {
@@ -595,13 +632,23 @@ func (woc *wfOperationCtx) processArtifactGCCompletion(ctx context.Context) erro
 		// we should still remove the finalizer to prevent it from being stuck forever.
 		// Checking hasGCPods avoids the race condition of inferring this from
 		// PodsRecouped==nil, which can also mean pods exist but haven't completed yet.
-		if !removeFinalizer && woc.allStrategiesProcessed() && !hasGCPods {
+		if !removeFinalizer && allProcessed && !hasGCPods {
 			removeFinalizer = true
 		}
 	} else {
 		// check if all artifacts have been deleted and if so remove Finalizer
-		removeFinalizer = woc.allArtifactsDeleted()
+		removeFinalizer = allDeleted
 	}
+
+	woc.log.WithFields(logging.Fields{
+		"workflow":               woc.wf.Name,
+		"forceFinalizerRemoval":  forceFinalizerRemoval,
+		"hasGCPods":              hasGCPods,
+		"allArtifactsDeleted":    allDeleted,
+		"allStrategiesProcessed": allProcessed,
+		"removeFinalizer":        removeFinalizer,
+	}).Info(ctx, "artifact GC finalizer removal decision")
+
 	if removeFinalizer {
 		woc.log.WithField("forceFinalizerRemoval", forceFinalizerRemoval).Info(ctx, "no remaining artifacts to GC, removing artifact GC finalizer")
 		woc.wf.Finalizers = slices.DeleteFunc(woc.wf.Finalizers,
@@ -611,18 +658,26 @@ func (woc *wfOperationCtx) processArtifactGCCompletion(ctx context.Context) erro
 	return nil
 }
 
-func (woc *wfOperationCtx) allArtifactsDeleted() bool {
+func (woc *wfOperationCtx) allArtifactsDeleted(ctx context.Context) bool {
+	undeleted := make([]string, 0)
 	for _, n := range woc.wf.Status.Nodes {
 		if n.Type != wfv1.NodeTypePod {
 			continue
 		}
 		for _, a := range n.GetOutputs().GetArtifacts() {
-			if !a.Deleted && woc.execWf.GetArtifactGCStrategy(&a) != wfv1.ArtifactGCNever && woc.execWf.GetArtifactGCStrategy(&a) != wfv1.ArtifactGCStrategyUndefined {
-				return false
+			strategy := woc.execWf.GetArtifactGCStrategy(&a)
+			if !a.Deleted && strategy != wfv1.ArtifactGCNever && strategy != wfv1.ArtifactGCStrategyUndefined {
+				undeleted = append(undeleted, fmt.Sprintf("%s/%s", n.ID, a.Name))
 			}
 		}
 	}
-	return true
+	if len(undeleted) > 0 {
+		woc.log.WithFields(logging.Fields{
+			"workflow":           woc.wf.Name,
+			"undeletedArtifacts": undeleted,
+		}).Info(ctx, "artifacts still pending GC deletion")
+	}
+	return len(undeleted) == 0
 }
 
 // allStrategiesProcessed returns true if all artifact GC strategies that this workflow actually
